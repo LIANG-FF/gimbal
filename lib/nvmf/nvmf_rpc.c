@@ -1951,3 +1951,123 @@ spdk_rpc_nvmf_get_stats(struct spdk_jsonrpc_request *request,
 }
 
 SPDK_RPC_REGISTER("nvmf_get_stats", spdk_rpc_nvmf_get_stats, SPDK_RPC_RUNTIME)
+
+struct rpc_nvmf_get_tmgr_stats_ctx {
+	char *tgt_name;
+	char *subnqn;
+	struct spdk_nvmf_poll_group_subsys_tmgr_stat tmgr_stat;
+	struct spdk_nvmf_tgt *tgt;
+	struct spdk_nvmf_subsystem *subsystem;
+	struct spdk_jsonrpc_request *request;
+	struct spdk_json_write_ctx *w;
+};
+
+static const struct spdk_json_object_decoder rpc_get_tgmr_stats_decoders[] = {
+	{"tgt_name", offsetof(struct rpc_nvmf_get_tmgr_stats_ctx, tgt_name), spdk_json_decode_string, true},
+	{"subnqn", offsetof(struct rpc_nvmf_get_tmgr_stats_ctx, subnqn), spdk_json_decode_string, true},
+};
+
+static void
+free_get_tmgr_stats_ctx(struct rpc_nvmf_get_tmgr_stats_ctx *ctx)
+{
+	free(ctx->subnqn);
+	free(ctx->tgt_name);
+	free(ctx);
+}
+
+static void
+rpc_nvmf_get_tmgr_stats_done(struct spdk_io_channel_iter *i, int status)
+{
+	struct rpc_nvmf_get_tmgr_stats_ctx *ctx = spdk_io_channel_iter_get_ctx(i);
+
+	ctx->tmgr_stat.ewma_write_cost = ctx->tmgr_stat.ewma_write_cost / ctx->tmgr_stat.thread_count;
+	ctx->tmgr_stat.read_ewma_latency_usec = ctx->tmgr_stat.read_ewma_latency_usec / ctx->tmgr_stat.thread_count;
+	ctx->tmgr_stat.write_ewma_latency_usec = ctx->tmgr_stat.write_ewma_latency_usec / ctx->tmgr_stat.thread_count;
+
+	spdk_json_write_named_uint32(ctx->w, "thread_count", ctx->tmgr_stat.thread_count);
+
+	spdk_json_write_named_uint32(ctx->w, "read_io_inflight_count", ctx->tmgr_stat.read_io_inflight_count);
+	spdk_json_write_named_uint64(ctx->w, "read_io_inflight_bytes", ctx->tmgr_stat.read_io_inflight_bytes);
+	spdk_json_write_named_uint64(ctx->w, "read_total_bytes", ctx->tmgr_stat.read_total_bytes);
+	spdk_json_write_named_uint64(ctx->w, "read_ewma_latency_usec", ctx->tmgr_stat.read_ewma_latency_usec);
+
+	spdk_json_write_named_uint32(ctx->w, "write_io_inflight_count", ctx->tmgr_stat.write_io_inflight_count);
+	spdk_json_write_named_uint64(ctx->w, "write_io_inflight_bytes", ctx->tmgr_stat.write_io_inflight_bytes);
+	spdk_json_write_named_uint64(ctx->w, "write_total_bytes", ctx->tmgr_stat.write_total_bytes);
+	spdk_json_write_named_uint64(ctx->w, "write_ewma_latency_usec", ctx->tmgr_stat.write_ewma_latency_usec);
+
+	spdk_json_write_named_string_fmt(ctx->w, "ewma_write_cost", "%.1f", ctx->tmgr_stat.ewma_write_cost);
+
+	//spdk_json_write_array_end(ctx->w);
+	spdk_json_write_object_end(ctx->w);
+	spdk_jsonrpc_end_result(ctx->request, ctx->w);
+	free_get_tmgr_stats_ctx(ctx);
+}
+
+static void
+rpc_nvmf_get_tmgr_stats(struct spdk_io_channel_iter *i)
+{
+	struct rpc_nvmf_get_tmgr_stats_ctx *ctx = spdk_io_channel_iter_get_ctx(i);
+
+	spdk_nvmf_poll_group_get_tmgr_stat_add(ctx->tgt, ctx->subsystem, &ctx->tmgr_stat);
+	spdk_for_each_channel_continue(i, 0);
+}
+
+static void
+spdk_rpc_nvmf_get_tmgr_stats(struct spdk_jsonrpc_request *request,
+			const struct spdk_json_val *params)
+{
+	struct rpc_nvmf_get_tmgr_stats_ctx *ctx;
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "Memory allocation error");
+		return;
+	}
+	ctx->request = request;
+
+	if (params) {
+		if (spdk_json_decode_object(params, rpc_get_tgmr_stats_decoders,
+					    SPDK_COUNTOF(rpc_get_tgmr_stats_decoders),
+					    ctx)) {
+			SPDK_ERRLOG("spdk_json_decode_object failed\n");
+			spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS, "Invalid parameters");
+			free_get_tmgr_stats_ctx(ctx);
+			return;
+		}
+	}
+
+	ctx->tgt = spdk_nvmf_get_tgt(ctx->tgt_name);
+	if (!ctx->tgt) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "Unable to find a target.");
+		free_get_tmgr_stats_ctx(ctx);
+		return;
+	}
+
+	ctx->subsystem = spdk_nvmf_tgt_find_subsystem(ctx->tgt, ctx->subnqn);
+	if (!ctx->subsystem) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "Unable to find a subsystem.");
+		free_get_tmgr_stats_ctx(ctx);
+		return;
+	}
+
+	ctx->w = spdk_jsonrpc_begin_result(ctx->request);
+	if (NULL == ctx->w) {
+		free_get_tmgr_stats_ctx(ctx);
+		return;
+	}
+
+	spdk_json_write_object_begin(ctx->w);
+	spdk_json_write_named_uint64(ctx->w, "tick_rate", spdk_get_ticks_hz());
+	//spdk_json_write_named_array_begin(ctx->w, "poll_groups");
+
+	spdk_for_each_channel(ctx->tgt,
+			      rpc_nvmf_get_tmgr_stats,
+			      ctx,
+			      rpc_nvmf_get_tmgr_stats_done);
+}
+
+SPDK_RPC_REGISTER("nvmf_get_tmgr_stats", spdk_rpc_nvmf_get_tmgr_stats, SPDK_RPC_RUNTIME)

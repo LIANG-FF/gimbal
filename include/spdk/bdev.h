@@ -1371,6 +1371,15 @@ void spdk_bdev_io_get_nvme_status(const struct spdk_bdev_io *bdev_io, uint32_t *
 				  int *sc);
 
 /**
+ * Get the status of bdev_io as an NVMe status code and command specific
+ * completion queue value.
+ *
+ * \param bdev_io I/O to get the status from.
+ * \param latency_ticks Comletion latency ticks
+ */
+void spdk_bdev_io_get_latency_ticks(const struct spdk_bdev_io *bdev_io, uint64_t *latency_ticks);
+
+/**
  * Get the status of bdev_io as a SCSI status code.
  *
  * \param bdev_io I/O to get the status from.

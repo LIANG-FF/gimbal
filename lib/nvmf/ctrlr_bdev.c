@@ -95,6 +95,7 @@ nvmf_bdev_ctrlr_complete_cmd(struct spdk_bdev_io *bdev_io, bool success,
 	int				sc, sct;
 	uint32_t			cdw0;
 
+	spdk_bdev_io_get_latency_ticks(bdev_io, &req->latency_ticks);
 	spdk_bdev_io_get_nvme_status(bdev_io, &cdw0, &sct, &sc);
 	response->cdw0 = cdw0;
 	response->status.sc = sc;

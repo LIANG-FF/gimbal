@@ -3745,7 +3745,7 @@ _spdk_bdev_io_complete(void *ctx)
 	}
 
 	tsc = spdk_get_ticks();
-	tsc_diff = tsc - bdev_io->internal.submit_tsc;
+	bdev_io->internal.latency_ticks = tsc_diff = tsc - bdev_io->internal.submit_tsc;
 	spdk_trace_record_tsc(tsc, TRACE_BDEV_IO_DONE, 0, 0, (uintptr_t)bdev_io, 0);
 
 	if (bdev_io->internal.ch->histogram) {
@@ -3948,6 +3948,13 @@ spdk_bdev_io_complete_nvme_status(struct spdk_bdev_io *bdev_io, uint32_t cdw0, i
 	bdev_io->internal.error.nvme.sc = sc;
 
 	spdk_bdev_io_complete(bdev_io, bdev_io->internal.status);
+}
+
+void
+spdk_bdev_io_get_latency_ticks(const struct spdk_bdev_io *bdev_io, uint64_t *latency_ticks)
+{
+	assert(latency_ticks != NULL);
+	*latency_ticks = bdev_io->internal.latency_ticks;
 }
 
 void

@@ -553,6 +553,7 @@ struct spdk_bdev_io {
 
 		/** Current tsc at submit time. Used to calculate latency at completion. */
 		uint64_t submit_tsc;
+		uint64_t latency_ticks;
 
 		/** Error information from a device */
 		union {

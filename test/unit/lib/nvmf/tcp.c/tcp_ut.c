@@ -194,6 +194,13 @@ DEFINE_STUB(spdk_sock_set_priority,
 
 DEFINE_STUB_V(spdk_nvmf_ns_reservation_request, (void *ctx));
 
+DEFINE_STUB_V(spdk_nvmf_tmgr_complete, (struct spdk_nvmf_request *req));
+
+DEFINE_STUB(spdk_nvmf_tmgr_is_enabled,
+            int,
+            (struct spdk_nvmf_qpair *qpair),
+            0);
+
 struct spdk_trace_histories *g_trace_histories;
 
 struct spdk_bdev {

@@ -172,6 +172,8 @@ DEFINE_STUB(spdk_nvmf_bdev_ctrlr_get_dif_ctx, bool,
 	     struct spdk_dif_ctx *dif_ctx),
 	    true);
 
+DEFINE_STUB_V(spdk_nvmf_tmgr_complete, (struct spdk_nvmf_request *req));
+
 int
 spdk_nvmf_qpair_disconnect(struct spdk_nvmf_qpair *qpair, nvmf_qpair_disconnect_cb cb_fn, void *ctx)
 {

@@ -152,6 +152,77 @@ struct spdk_nvmf_subsystem_pg_ns_info {
 	uint64_t			num_blocks;
 };
 
+struct spdk_nvmf_iosched_ops {
+	void*	(*init)(void *ctx);
+	void 	(*destroy)(void *ctx);
+	void 	(*enqueue)(void *ctx, void *req);
+	void*	(*dequeue)(void *ctx);
+	void	(*release)(void *req);
+	void	(*flush)(void *ctx);
+	uint32_t	(*get_credit)(void *ctx);
+	void	(*qpair_destroy)(void *ctx);
+ };
+
+struct spdk_nvmf_tmgr_rate {
+	int64_t target_rate;
+	uint64_t last_refill_tsc;
+	uint64_t max_bucket_size;
+	uint64_t read_tokens;
+	uint64_t write_tokens;
+
+	int64_t cpl_rate;
+	uint64_t cpl_bytes;
+	uint64_t next_cpl_rate_tsc;
+	uint64_t cpl_rate_ticks;
+
+	uint64_t total_processed_bytes;
+	uint64_t total_completes;
+	uint64_t last_stat_bytes;
+	uint64_t last_stat_cpls;
+};
+
+struct spdk_nvmf_tmgr_lat_cong {
+	uint64_t lathresh_ticks;
+	uint64_t lathresh_max_ticks;
+	uint64_t lathresh_min_ticks;
+	uint64_t lathresh_residue;
+	uint64_t ewma_latency_ticks;
+	uint64_t total_lat_ticks;
+	uint64_t total_io;
+	uint64_t total_bytes;
+	uint64_t last_stat_lat_ticks;
+	uint32_t last_stat_io;
+	uint64_t last_stat_bytes;
+
+	uint32_t congestion_count;
+	uint64_t last_stat_cong;
+	uint32_t overloaded_count;
+};
+
+struct spdk_nvmf_tmgr {
+	int		in_submit;
+
+	struct spdk_nvmf_tmgr_rate	rate;
+	struct spdk_nvmf_tmgr_lat_cong	read_cong;
+	struct spdk_nvmf_tmgr_lat_cong	write_cong;
+
+	int64_t write_cost;
+	int64_t ewma_write_cost;
+
+	uint32_t io_outstanding;
+	uint32_t io_waiting;
+	uint64_t stat_last_tsc;
+
+	struct spdk_poller		*poller;
+	struct spdk_poller		*submit_poller;
+
+	struct spdk_nvmf_iosched_ops	iosched_ops;
+	void *sched_ctx;
+
+	TAILQ_HEAD(, spdk_nvmf_request)		read_queued;
+	TAILQ_HEAD(, spdk_nvmf_request)		write_queued;
+};
+
 typedef void(*spdk_nvmf_poll_group_mod_done)(void *cb_arg, int status);
 
 struct spdk_nvmf_subsystem_poll_group {
@@ -166,6 +237,8 @@ struct spdk_nvmf_subsystem_poll_group {
 	enum spdk_nvmf_subsystem_state		state;
 
 	TAILQ_HEAD(, spdk_nvmf_request)		queued;
+
+	struct spdk_nvmf_tmgr		*tmgr;
 };
 
 struct spdk_nvmf_poll_group {
@@ -226,6 +299,13 @@ struct spdk_nvmf_request {
 	bool				data_from_pool;
 	struct spdk_bdev_io_wait_entry	bdev_io_wait;
 	struct spdk_nvmf_dif_info	dif;
+	uint64_t			latency_ticks;
+	bool				tmgr_enabled;
+	uint32_t			vqe_id;
+
+	// for SFQ
+	uint64_t			start_vtime;
+	uint64_t			finish_vtime;
 
 	STAILQ_ENTRY(spdk_nvmf_request)	buf_link;
 	TAILQ_ENTRY(spdk_nvmf_request)	link;
@@ -262,6 +342,16 @@ struct spdk_nvmf_ns {
 	bool ptpl_activated;
 };
 
+#define PQUEUE_MAX_NUM         4           /* Number of priority queues */
+#define QUEUE0_THRESHOLD        16          /* Queue 0: 16 items */
+#define QUEUE1_THRESHOLD        4           /* Queue 1: 4 items  */
+#define QUEUE2_THRESHOLD        2           /* Queue 2: 2 items  */
+#define QUEUE3_THRESHOLD        1           /* Queue 3: 1 items  */
+#define BATCH_SIZE              32          /* Maximum processing batch size */
+#define EPOCH_THRESHOLD         32          /* Epoch threshold*/
+#define MAX_IOS_WAIT_FOR_PRIO	(QUEUE1_THRESHOLD + QUEUE2_THRESHOLD + QUEUE3_THRESHOLD)
+#define EPOCH_TIMESLICE_IN_USEC		500000
+
 struct spdk_nvmf_qpair {
 	enum spdk_nvmf_qpair_state		state;
 	spdk_nvmf_state_change_done		state_cb;
@@ -275,8 +365,18 @@ struct spdk_nvmf_qpair {
 	uint16_t				sq_head;
 	uint16_t				sq_head_max;
 
+	int32_t 				remaining_quota[PQUEUE_MAX_NUM];
+	uint64_t 				epoch_last_timeslice;
+	uint64_t 				epoch_timeslize_size;
+	int32_t 				io_waiting;
+	TAILQ_HEAD(, spdk_nvmf_request)		pqueue[PQUEUE_MAX_NUM];
+
 	TAILQ_HEAD(, spdk_nvmf_request)		outstanding;
 	TAILQ_ENTRY(spdk_nvmf_qpair)		link;
+
+	struct spdk_nvmf_tmgr		*tmgr;
+	void		*iosched_ctx;
+	TAILQ_ENTRY(spdk_nvmf_qpair)		iosched_link;
 };
 
 struct spdk_nvmf_ctrlr_feat {
@@ -335,6 +435,7 @@ struct spdk_nvmf_ctrlr {
 	/* Time to trigger keep-alive--poller_time = now_tick + period */
 	uint64_t			last_keep_alive_tick;
 	struct spdk_poller		*keep_alive_poller;
+	struct spdk_poller		*pqueue_poller;
 
 	bool				dif_insert_or_strip;
 
@@ -371,7 +472,6 @@ struct spdk_nvmf_subsystem {
 
 	TAILQ_ENTRY(spdk_nvmf_subsystem)	entries;
 };
-
 
 struct spdk_nvmf_transport *spdk_nvmf_tgt_get_transport(struct spdk_nvmf_tgt *tgt,
 		enum spdk_nvme_transport_type);
@@ -415,9 +515,17 @@ void spdk_nvmf_ctrlr_destruct(struct spdk_nvmf_ctrlr *ctrlr);
 int spdk_nvmf_ctrlr_process_fabrics_cmd(struct spdk_nvmf_request *req);
 int spdk_nvmf_ctrlr_process_admin_cmd(struct spdk_nvmf_request *req);
 int spdk_nvmf_ctrlr_process_io_cmd(struct spdk_nvmf_request *req);
+int spdk_nvmf_ctrlr_process_io_cmd_prio(struct spdk_nvmf_request *req);
 bool spdk_nvmf_ctrlr_dsm_supported(struct spdk_nvmf_ctrlr *ctrlr);
 bool spdk_nvmf_ctrlr_write_zeroes_supported(struct spdk_nvmf_ctrlr *ctrlr);
 void spdk_nvmf_ctrlr_ns_changed(struct spdk_nvmf_ctrlr *ctrlr, uint32_t nsid);
+
+void spdk_nvmf_tmgr_init(struct spdk_nvmf_tmgr *tmgr);
+void spdk_nvmf_tmgr_enable(struct spdk_nvmf_tmgr *tmgr);
+void spdk_nvmf_tmgr_disable(struct spdk_nvmf_tmgr *tmgr);
+void spdk_nvmf_tmgr_complete(struct spdk_nvmf_request *req);
+int spdk_nvmf_tmgr_is_enabled(struct spdk_nvmf_qpair *qpair);
+float spdk_nvmf_tmgr_get_ewma_write_cost_float(struct spdk_nvmf_tmgr *tmgr);
 
 void spdk_nvmf_bdev_ctrlr_identify_ns(struct spdk_nvmf_ns *ns, struct spdk_nvme_ns_data *nsdata,
 				      bool dif_insert_or_strip);

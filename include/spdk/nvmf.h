@@ -92,6 +92,22 @@ struct spdk_nvmf_poll_group_stat {
 	uint64_t pending_bdev_io;
 };
 
+struct spdk_nvmf_poll_group_subsys_tmgr_stat {
+	uint32_t thread_count;
+
+	uint32_t read_io_inflight_count;
+	uint64_t read_io_inflight_bytes;
+	uint64_t read_total_bytes;
+	uint64_t read_ewma_latency_usec;
+	uint32_t write_io_inflight_count;
+	uint64_t write_io_inflight_bytes;
+	uint64_t write_total_bytes;
+	uint64_t write_ewma_latency_usec;
+
+	float ewma_write_cost;
+
+};
+
 struct spdk_nvmf_rdma_device_stat {
 	const char *name;
 	uint64_t polls;
@@ -282,6 +298,10 @@ int spdk_nvmf_poll_group_add(struct spdk_nvmf_poll_group *group,
  */
 int spdk_nvmf_poll_group_get_stat(struct spdk_nvmf_tgt *tgt,
 				  struct spdk_nvmf_poll_group_stat *stat);
+
+int spdk_nvmf_poll_group_get_tmgr_stat_add(struct spdk_nvmf_tgt *tgt,
+				  struct spdk_nvmf_subsystem *subsystem,
+			      struct spdk_nvmf_poll_group_subsys_tmgr_stat *tmgr_stat);
 
 typedef void (*nvmf_qpair_disconnect_cb)(void *ctx);
 

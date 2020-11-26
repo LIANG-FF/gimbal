@@ -799,6 +799,26 @@ _spdk_nvmf_qpair_destroy(void *ctx, int status)
 				}
 			}
 		}
+
+		if (qpair->tmgr) {
+			TAILQ_FOREACH_SAFE(req, &qpair->tmgr->read_queued, link, tmp) {
+				if (req->qpair == qpair) {
+					TAILQ_REMOVE(&qpair->tmgr->read_queued, req, link);
+					if (spdk_nvmf_transport_req_free(req)) {
+						SPDK_ERRLOG("Transport request free error!\n");
+					}
+				}
+			}
+			TAILQ_FOREACH_SAFE(req, &qpair->tmgr->write_queued, link, tmp) {
+				if (req->qpair == qpair) {
+					TAILQ_REMOVE(&qpair->tmgr->write_queued, req, link);
+					if (spdk_nvmf_transport_req_free(req)) {
+						SPDK_ERRLOG("Transport request free error!\n");
+					}
+				}
+			}
+			qpair->tmgr->iosched_ops.qpair_destroy(qpair);
+		}
 	}
 
 	TAILQ_REMOVE(&qpair->group->qpairs, qpair, link);
@@ -1095,6 +1115,9 @@ spdk_nvmf_poll_group_add_subsystem(struct spdk_nvmf_poll_group *group,
 	struct spdk_nvmf_subsystem_poll_group *sgroup = &group->sgroups[subsystem->id];
 
 	TAILQ_INIT(&sgroup->queued);
+	sgroup->tmgr = calloc(1, sizeof(struct spdk_nvmf_tmgr));
+	spdk_nvmf_tmgr_init(sgroup->tmgr);
+	spdk_nvmf_tmgr_enable(sgroup->tmgr);
 
 	rc = poll_group_update_subsystem(group, subsystem);
 	if (rc) {
@@ -1142,6 +1165,9 @@ _nvmf_poll_group_remove_subsystem_cb(void *ctx, int status)
 	sgroup->num_ns = 0;
 	free(sgroup->ns_info);
 	sgroup->ns_info = NULL;
+	spdk_nvmf_tmgr_disable(sgroup->tmgr);
+	free(sgroup->tmgr);
+	sgroup->tmgr = NULL;
 fini:
 	free(qpair_ctx);
 	if (cpl_fn) {
@@ -1328,6 +1354,37 @@ spdk_nvmf_poll_group_get_stat(struct spdk_nvmf_tgt *tgt,
 	ch = spdk_get_io_channel(tgt);
 	group = spdk_io_channel_get_ctx(ch);
 	*stat = group->stat;
+	spdk_put_io_channel(ch);
+	return 0;
+}
+
+int
+spdk_nvmf_poll_group_get_tmgr_stat_add(struct spdk_nvmf_tgt *tgt,
+				  struct spdk_nvmf_subsystem *subsystem,
+			      struct spdk_nvmf_poll_group_subsys_tmgr_stat *tmgr_stat)
+{
+	struct spdk_io_channel *ch;
+	struct spdk_nvmf_poll_group *group;
+	struct spdk_nvmf_subsystem_poll_group *sgroup;
+
+	if (tgt == NULL || subsystem == NULL || tmgr_stat == NULL) {
+		return -EINVAL;
+	}
+
+	ch = spdk_get_io_channel(tgt);
+	group = spdk_io_channel_get_ctx(ch);
+	sgroup = &group->sgroups[subsystem->id];
+
+	tmgr_stat->thread_count++;
+	tmgr_stat->read_total_bytes += sgroup->tmgr->rate.total_processed_bytes;
+	tmgr_stat->read_ewma_latency_usec += sgroup->tmgr->read_cong.ewma_latency_ticks
+										  * SPDK_SEC_TO_USEC / spdk_get_ticks_hz();
+	tmgr_stat->write_total_bytes += sgroup->tmgr->rate.total_processed_bytes;
+	tmgr_stat->write_ewma_latency_usec += sgroup->tmgr->write_cong.ewma_latency_ticks
+										  * SPDK_SEC_TO_USEC / spdk_get_ticks_hz();
+	
+	tmgr_stat->ewma_write_cost += spdk_nvmf_tmgr_get_ewma_write_cost_float(sgroup->tmgr);
+
 	spdk_put_io_channel(ch);
 	return 0;
 }

@@ -58,6 +58,17 @@
  */
 #define FW_VERSION SPDK_VERSION_MAJOR_STRING SPDK_VERSION_MINOR_STRING SPDK_VERSION_PATCH_STRING
 
+//#define SPDK_NVMF_PQUEUE
+#ifdef SPDK_NVMF_PQUEUE
+static const int priority_threshold[] = {
+				QUEUE0_THRESHOLD,
+				QUEUE1_THRESHOLD,
+				QUEUE2_THRESHOLD,
+				QUEUE3_THRESHOLD
+			};
+
+static int spdk_nvmf_ctrlr_pqueue_poller(void *arg);
+#endif
 static inline void
 spdk_nvmf_invalid_connect_response(struct spdk_nvmf_fabric_connect_rsp *rsp,
 				   uint8_t iattr, uint16_t ipo)
@@ -205,6 +216,18 @@ ctrlr_add_qpair_and_update_rsp(struct spdk_nvmf_qpair *qpair,
 	qpair->ctrlr = ctrlr;
 	spdk_bit_array_set(ctrlr->qpair_mask, qpair->qid);
 
+#ifdef SPDK_NVMF_PQUEUE
+	qpair->io_waiting = 0;
+	qpair->epoch_last_timeslice = spdk_get_ticks();
+	qpair->epoch_timeslize_size = EPOCH_TIMESLICE_IN_USEC * spdk_get_ticks_hz() / SPDK_SEC_TO_USEC;
+
+	for (int i=0; i < PQUEUE_MAX_NUM; i++) {
+		TAILQ_INIT(&qpair->pqueue[i]);
+		qpair->remaining_quota[i] = priority_threshold[i];
+	}
+#endif
+	qpair->tmgr = qpair->group->sgroups[ctrlr->subsys->id].tmgr;
+
 	rsp->status.sc = SPDK_NVME_SC_SUCCESS;
 	rsp->status_code_specific.success.cntlid = ctrlr->cntlid;
 	SPDK_DEBUGLOG(SPDK_LOG_NVMF, "connect capsule response: cntlid = 0x%04x\n",
@@ -348,7 +371,9 @@ spdk_nvmf_ctrlr_create(struct spdk_nvmf_subsystem *subsystem,
 	SPDK_DEBUGLOG(SPDK_LOG_NVMF, "csts 0x%x\n", ctrlr->vcprop.csts.raw);
 
 	ctrlr->dif_insert_or_strip = transport->opts.dif_insert_or_strip;
-
+#ifdef SPDK_NVMF_PQUEUE
+	ctrlr->pqueue_poller = spdk_poller_register(spdk_nvmf_ctrlr_pqueue_poller, ctrlr, EPOCH_TIMESLICE_IN_USEC);
+#endif
 	req->qpair->ctrlr = ctrlr;
 	spdk_thread_send_msg(subsystem->thread, _spdk_nvmf_subsystem_add_ctrlr, req);
 
@@ -367,6 +392,9 @@ _spdk_nvmf_ctrlr_destruct(void *ctx)
 		TAILQ_REMOVE(&ctrlr->log_head, log, link);
 		free(log);
 	}
+#ifdef SPDK_NVMF_PQUEUE
+	spdk_poller_unregister(&ctrlr->pqueue_poller);
+#endif
 	free(ctrlr);
 }
 
@@ -2430,6 +2458,7 @@ spdk_nvmf_ctrlr_process_io_cmd(struct spdk_nvmf_request *req)
 	bdev = ns->bdev;
 	desc = ns->desc;
 	ch = ns_info->channel;
+
 	switch (cmd->opc) {
 	case SPDK_NVME_OPC_READ:
 		return spdk_nvmf_bdev_ctrlr_read_cmd(bdev, desc, ch, req);
@@ -2452,6 +2481,170 @@ spdk_nvmf_ctrlr_process_io_cmd(struct spdk_nvmf_request *req)
 	}
 }
 
+#ifdef SPDK_NVMF_PQUEUE
+static void
+_spdk_nvmf_ctrlr_pqueue_update_quota(struct spdk_nvmf_qpair *qpair)
+{
+	int i;
+
+	for (i=0; i < PQUEUE_MAX_NUM; i++) {
+		qpair->remaining_quota[i] = priority_threshold[i];
+	}
+
+	return;
+}
+
+/* 
+ * We allow lower-priority IOs to be submitted if they have remaining quota.
+ * If the number of IOs waiting is more than MAX_IOS_WAIT_FOR_PRIO or time elapsed 1ms
+ * from the last submission, we update the quota and try to submit as many as possible.
+ * The support poller helps to run the queue if no IO comes.
+ */
+
+static void
+_spdk_nvmf_ctrlr_pqueue_process_ios(struct spdk_nvmf_qpair *qpair)
+{
+	int i, submitted_ios = 0;
+	struct spdk_nvmf_request *req;
+	struct spdk_nvmf_tmgr	*tmgr;
+	uint64_t now = spdk_get_ticks();
+
+	if (qpair->io_waiting > MAX_IOS_WAIT_FOR_PRIO
+		 || now > (qpair->epoch_last_timeslice + qpair->epoch_timeslize_size) ) {
+		_spdk_nvmf_ctrlr_pqueue_update_quota(qpair);
+	}
+	
+	tmgr = qpair->tmgr;
+
+	for (i=0; i < PQUEUE_MAX_NUM; i++) {
+		while (!TAILQ_EMPTY(&qpair->pqueue[i])) {
+			if (qpair->remaining_quota[i] <= 0) {
+				break;
+			}
+
+			req = TAILQ_FIRST(&qpair->pqueue[i]);
+			TAILQ_REMOVE(&qpair->pqueue[i], req, link);
+			tmgr->iosched_ops.enqueue(tmgr->sched_ctx, req);
+
+			SPDK_DEBUGLOG(SPDK_LOG_NVMF, "%s qid: %u prio %d opc 0x%02x fuse %u cid %u nsid %u cdw10 0x%08x\n",
+			      spdk_thread_get_name(qpair->group->thread), qpair->qid, i,
+			      req->cmd->nvme_cmd.opc, req->cmd->nvme_cmd.fuse, req->cmd->nvme_cmd.cid, req->cmd->nvme_cmd.nsid, req->cmd->nvme_cmd.cdw10);
+
+			submitted_ios++;
+			qpair->remaining_quota[i]--;
+		}
+	}
+
+	qpair->io_waiting -= submitted_ios;
+	return;
+}
+#endif
+
+static int
+spdk_nvmf_ctrlr_process_io_cmd_tmgr(struct spdk_nvmf_request *req)
+{
+	struct spdk_nvmf_qpair		*qpair	= req->qpair;
+	struct spdk_nvmf_tmgr		*tmgr = qpair->tmgr;
+	struct spdk_nvmf_ctrlr *ctrlr = req->qpair->ctrlr;
+	struct spdk_nvme_cmd *cmd 			= &req->cmd->nvme_cmd;
+	struct spdk_nvme_cpl *response 		= &req->rsp->nvme_cpl;
+	uint32_t priority 			= cmd->rsvd3;
+
+	if (spdk_unlikely(ctrlr == NULL)) {
+		SPDK_ERRLOG("I/O command sent before CONNECT\n");
+		response->status.sct = SPDK_NVME_SCT_GENERIC;
+		response->status.sc = SPDK_NVME_SC_COMMAND_SEQUENCE_ERROR;
+		return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
+	}
+
+	if (priority >= PQUEUE_MAX_NUM) {
+		SPDK_ERRLOG("nvmf: invalid priority (%u)\n", priority);
+		response->status.sc = SPDK_NVME_SC_INVALID_FIELD;
+		response->status.dnr = 1;
+		return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
+	}
+
+	switch (cmd->opc) {
+	case SPDK_NVME_OPC_READ:
+	case SPDK_NVME_OPC_WRITE:
+	case SPDK_NVME_OPC_WRITE_ZEROES:
+	case SPDK_NVME_OPC_FLUSH:
+		req->tmgr_enabled = true;
+		/* Traffic Manager will place the request on the oustanding list when it is scheduled */
+		TAILQ_REMOVE(&qpair->outstanding, req, link);
+#ifdef SPDK_NVMF_PQUEUE
+		if (TAILQ_EMPTY(&qpair->pqueue[priority]) && qpair->remaining_quota[priority] > 0) {
+			// we have remaining quota and no other IOs in the same pqueue
+			// so enqueue the request to the traffic manager
+			qpair->remaining_quota[priority]--;
+			tmgr->iosched_ops.enqueue(tmgr->sched_ctx, req);
+		} else {
+			TAILQ_INSERT_TAIL(&qpair->pqueue[priority], req, link);
+			qpair->io_waiting++;
+			_spdk_nvmf_ctrlr_pqueue_process_ios(qpair);
+		}
+#else
+	tmgr->iosched_ops.enqueue(tmgr->sched_ctx, req);
+#endif
+		break;
+	default:
+		return spdk_nvmf_ctrlr_process_io_cmd(req);
+	}
+
+	return SPDK_NVMF_REQUEST_EXEC_STATUS_ASYNCHRONOUS;
+}
+
+#ifdef SPDK_NVMF_PQUEUE
+static void
+spdk_nvmf_ctrlr_refresh_qpairs_done(struct spdk_io_channel_iter *i, int status)
+{
+	if (status == 0) {
+		SPDK_DEBUGLOG(SPDK_LOG_NVMF, "refresh ctrlr qpairs complete successfully\n");
+	} else {
+		SPDK_ERRLOG("Fail to refresh ctrlr qpairs\n");
+	}
+}
+
+static void
+spdk_nvmf_ctrlr_refresh_qpairs(struct spdk_io_channel_iter *i)
+{
+	struct spdk_nvmf_ctrlr *ctrlr;
+	struct spdk_nvmf_qpair *qpair, *temp_qpair;
+	struct spdk_io_channel *ch;
+	struct spdk_nvmf_poll_group *group;
+
+	ctrlr = spdk_io_channel_iter_get_ctx(i);
+	ch = spdk_io_channel_iter_get_channel(i);
+	group = spdk_io_channel_get_ctx(ch);
+
+	TAILQ_FOREACH_SAFE(qpair, &group->qpairs, link, temp_qpair) {
+		if (qpair->ctrlr == ctrlr) {
+			assert(qpair->group->thread == spdk_get_thread());
+			_spdk_nvmf_ctrlr_pqueue_process_ios(qpair);
+		}
+	}
+
+	spdk_for_each_channel_continue(i, 0);
+}
+
+/* Support poller for priority queue
+ * We check the epoch timeslice, and simply call _spdk_nvmf_ctrlr_pqueue_process_ios()
+ * if the timeslice has expired.
+ */
+static int
+spdk_nvmf_ctrlr_pqueue_poller(void *arg)
+{
+	struct spdk_nvmf_ctrlr *ctrlr = (struct spdk_nvmf_ctrlr *)arg;
+
+	spdk_for_each_channel(ctrlr->subsys->tgt,
+				spdk_nvmf_ctrlr_refresh_qpairs,
+				ctrlr,
+				spdk_nvmf_ctrlr_refresh_qpairs_done);
+
+	return 0;
+}
+#endif
+
 static void
 spdk_nvmf_qpair_request_cleanup(struct spdk_nvmf_qpair *qpair)
 {
@@ -2461,8 +2654,6 @@ spdk_nvmf_qpair_request_cleanup(struct spdk_nvmf_qpair *qpair)
 		if (TAILQ_EMPTY(&qpair->outstanding)) {
 			qpair->state_cb(qpair->state_cb_arg, 0);
 		}
-	} else {
-		assert(qpair->state == SPDK_NVMF_QPAIR_ACTIVE);
 	}
 }
 
@@ -2501,6 +2692,10 @@ spdk_nvmf_request_complete(struct spdk_nvmf_request *req)
 		      "cpl: cid=%u cdw0=0x%08x rsvd1=%u status=0x%04x\n",
 		      rsp->cid, rsp->cdw0, rsp->rsvd1,
 		      *(uint16_t *)&rsp->status);
+
+	if (req->tmgr_enabled) {
+		spdk_nvmf_tmgr_complete(req);
+	}
 
 	TAILQ_REMOVE(&qpair->outstanding, req, link);
 	if (spdk_nvmf_transport_req_complete(req)) {
@@ -2608,13 +2803,14 @@ spdk_nvmf_request_exec(struct spdk_nvmf_request *req)
 
 	/* Place the request on the outstanding list so we can keep track of it */
 	TAILQ_INSERT_TAIL(&qpair->outstanding, req, link);
-
+	req->tmgr_enabled = false;
+	
 	if (spdk_unlikely(req->cmd->nvmf_cmd.opcode == SPDK_NVME_OPC_FABRIC)) {
 		status = spdk_nvmf_ctrlr_process_fabrics_cmd(req);
 	} else if (spdk_unlikely(spdk_nvmf_qpair_is_admin_queue(qpair))) {
 		status = spdk_nvmf_ctrlr_process_admin_cmd(req);
 	} else {
-		status = spdk_nvmf_ctrlr_process_io_cmd(req);
+		status = spdk_nvmf_ctrlr_process_io_cmd_tmgr(req);
 	}
 
 	if (status == SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE) {

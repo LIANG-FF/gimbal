@@ -1352,6 +1352,8 @@ spdk_nvmf_subsystem_add_ctrlr(struct spdk_nvmf_subsystem *subsystem, struct spdk
 
 	TAILQ_INSERT_TAIL(&subsystem->ctrlrs, ctrlr, link);
 
+	SPDK_DEBUGLOG(SPDK_LOG_NVMF, "Add ctrlr id %u to Subsystem id %u.\n",
+		      ctrlr->cntlid, subsystem->id);
 	return 0;
 }
 
@@ -1361,6 +1363,9 @@ spdk_nvmf_subsystem_remove_ctrlr(struct spdk_nvmf_subsystem *subsystem,
 {
 	assert(subsystem == ctrlr->subsys);
 	TAILQ_REMOVE(&subsystem->ctrlrs, ctrlr, link);
+
+	SPDK_DEBUGLOG(SPDK_LOG_NVMF, "Remove ctrlr id %u to Subsystem id %u.\n",
+		      ctrlr->cntlid, subsystem->id);
 }
 
 struct spdk_nvmf_ctrlr *
