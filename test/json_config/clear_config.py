@@ -42,7 +42,6 @@ def get_bdev_delete_method(bdev):
                          'bdev_crypto_create': "bdev_crypto_delete",
                          'bdev_delay_create': "bdev_delay_delete",
                          'bdev_passthru_create': "bdev_passthru_delete",
-                         'bdev_flow_create': "bdev_flow_delete",
                          'bdev_compress_create': 'bdev_compress_delete',
                          }
     destroy_method = None
